@@ -3,6 +3,7 @@
 import { DashboardContext, useDashboard } from "@/components/DashboardContext";
 import { Person, RelationshipType } from "@/types";
 import { formatDisplayDate } from "@/utils/dateHelpers";
+import { getAvatarBg } from "@/utils/styleHelprs";
 import { createClient } from "@/utils/supabase/client";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
@@ -10,10 +11,9 @@ import { useCallback, useContext, useEffect, useState } from "react";
 import DefaultAvatar from "./DefaultAvatar";
 
 interface RelationshipManagerProps {
-  personId: string;
+  person: Person;
   isAdmin: boolean;
   canEdit?: boolean;
-  personGender: string; // Passed down to calculate default spouse gender
   onStatsLoaded?: (stats: {
     biologicalChildren: number;
     maleBiologicalChildren: number;
@@ -34,16 +34,18 @@ interface EnrichedRelationship {
 }
 
 export default function RelationshipManager({
-  personId,
+  person,
   isAdmin,
   canEdit = false,
-  personGender,
   onStatsLoaded,
 }: RelationshipManagerProps) {
   const supabase = createClient();
   const dashboardContext = useContext(DashboardContext);
   const { setMemberModalId } = useDashboard();
   const router = useRouter();
+  
+  const personId = person.id;
+  const personGender = person.gender;
 
   // If inside DashboardProvider → open modal; otherwise → navigate to full page
   const handlePersonClick = (id: string) => {
@@ -202,12 +204,17 @@ export default function RelationshipManager({
           (r) => r.direction === "child" && r.type === "biological_child",
         );
         const biologicalChildren = biologicalChildrenList.length;
-        const maleBiologicalChildren = biologicalChildrenList.filter(c => c.targetPerson.gender === "male").length;
-        const femaleBiologicalChildren = biologicalChildrenList.filter(c => c.targetPerson.gender === "female").length;
+        const maleBiologicalChildren = biologicalChildrenList.filter(
+          (c) => c.targetPerson.gender === "male",
+        ).length;
+        const femaleBiologicalChildren = biologicalChildrenList.filter(
+          (c) => c.targetPerson.gender === "female",
+        ).length;
 
         const daughterInLaw = formattedRels.filter(
           (r) =>
-            r.direction === "child_in_law" && r.targetPerson.gender === "female",
+            r.direction === "child_in_law" &&
+            r.targetPerson.gender === "female",
         ).length;
         const sonInLaw = formattedRels.filter(
           (r) =>
@@ -218,33 +225,43 @@ export default function RelationshipManager({
         let paternalGrandchildren = 0;
         let maternalGrandchildren = 0;
         if (childrenIds.length > 0) {
-           const { data: grandchildrenData } = await supabase
-             .from("relationships")
-             .select("id, person_a")
-             .in("type", ["biological_child", "adopted_child"])
-             .in("person_a", childrenIds);
-           
-           if (grandchildrenData) {
-             const maleChildrenIds = formattedRels
-               .filter((r) => r.direction === "child" && r.targetPerson.gender === "male")
-               .map((r) => r.targetPerson.id);
-             const femaleChildrenIds = formattedRels
-               .filter((r) => r.direction === "child" && r.targetPerson.gender === "female")
-               .map((r) => r.targetPerson.id);
+          const { data: grandchildrenData } = await supabase
+            .from("relationships")
+            .select("id, person_a")
+            .in("type", ["biological_child", "adopted_child"])
+            .in("person_a", childrenIds);
 
-             paternalGrandchildren = grandchildrenData.filter((g) => maleChildrenIds.includes(g.person_a)).length;
-             maternalGrandchildren = grandchildrenData.filter((g) => femaleChildrenIds.includes(g.person_a)).length;
-           }
+          if (grandchildrenData) {
+            const maleChildrenIds = formattedRels
+              .filter(
+                (r) =>
+                  r.direction === "child" && r.targetPerson.gender === "male",
+              )
+              .map((r) => r.targetPerson.id);
+            const femaleChildrenIds = formattedRels
+              .filter(
+                (r) =>
+                  r.direction === "child" && r.targetPerson.gender === "female",
+              )
+              .map((r) => r.targetPerson.id);
+
+            paternalGrandchildren = grandchildrenData.filter((g) =>
+              maleChildrenIds.includes(g.person_a),
+            ).length;
+            maternalGrandchildren = grandchildrenData.filter((g) =>
+              femaleChildrenIds.includes(g.person_a),
+            ).length;
+          }
         }
-        
-        onStatsLoaded({ 
-          biologicalChildren, 
-          maleBiologicalChildren, 
-          femaleBiologicalChildren, 
+
+        onStatsLoaded({
+          biologicalChildren,
+          maleBiologicalChildren,
+          femaleBiologicalChildren,
           paternalGrandchildren,
-          maternalGrandchildren, 
-          sonInLaw, 
-          daughterInLaw 
+          maternalGrandchildren,
+          sonInLaw,
+          daughterInLaw,
         });
       }
 
@@ -339,6 +356,47 @@ export default function RelationshipManager({
 
       if (error) throw error;
 
+      // Auto-update target person generation and is_in_law if currently missing
+      try {
+        const { data: targetPerson } = await supabase
+          .from("persons")
+          .select("generation, is_in_law")
+          .eq("id", selectedTargetId)
+          .single();
+
+        if (
+          targetPerson &&
+          (targetPerson.generation == null || targetPerson.is_in_law == null)
+        ) {
+          const updates: { generation?: number; is_in_law?: boolean } = {};
+
+          if (targetPerson.generation == null && person.generation != null) {
+            if (newRelDirection === "child")
+              updates.generation = person.generation + 1;
+            else if (newRelDirection === "parent")
+              updates.generation = person.generation - 1;
+            else if (newRelDirection === "spouse")
+              updates.generation = person.generation;
+          }
+
+          if (targetPerson.is_in_law == null) {
+            if (newRelDirection === "child" || newRelDirection === "parent")
+              updates.is_in_law = false;
+            else if (newRelDirection === "spouse")
+              updates.is_in_law = person.is_in_law === true ? false : true;
+          }
+
+          if (Object.keys(updates).length > 0) {
+            await supabase
+              .from("persons")
+              .update(updates)
+              .eq("id", selectedTargetId);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to auto-update target person properties", err);
+      }
+
       setIsAdding(false);
       setSearchTerm("");
       setSelectedTargetId(null);
@@ -378,10 +436,17 @@ export default function RelationshipManager({
           gender: "male" | "female" | "other";
           birth_year?: number;
           birth_order?: number;
+          is_in_law?: boolean;
+          generation?: number;
         } = {
           full_name: child.name.trim(),
           gender: child.gender,
+          is_in_law: false,
         };
+
+        if (person.generation != null) {
+          personPayload.generation = person.generation + 1;
+        }
         if (child.birthYear.trim() !== "") {
           const year = parseInt(child.birthYear);
           if (!isNaN(year)) personPayload.birth_year = year;
@@ -477,10 +542,17 @@ export default function RelationshipManager({
         full_name: string;
         gender: "male" | "female" | "other";
         birth_year?: number;
+        is_in_law?: boolean;
+        generation?: number;
       } = {
         full_name: newSpouseName.trim(),
         gender: newSpouseGender,
+        is_in_law: person.is_in_law === true ? false : true,
       };
+
+      if (person.generation != null) {
+        personPayload.generation = person.generation;
+      }
 
       if (newSpouseBirthYear.trim() !== "") {
         const year = parseInt(newSpouseBirthYear);
@@ -592,8 +664,8 @@ export default function RelationshipManager({
                       className="flex items-center gap-3 hover:bg-stone-100 p-2.5 -mx-2.5 rounded-xl transition-all duration-200 flex-1 text-left"
                     >
                       <div
-                        className={`h-8 w-8 rounded-full flex items-center justify-center text-xs text-white overflow-hidden
-                            ${rel.targetPerson.gender === "male" ? "bg-sky-700" : rel.targetPerson.gender === "female" ? "bg-rose-700" : "bg-stone-500"}`}
+                        className={`size-8 rounded-full flex items-center justify-center text-xs text-white overflow-hidden
+                            ${getAvatarBg(rel.targetPerson.gender)}`}
                       >
                         {rel.targetPerson.avatar_url ? (
                           <Image
@@ -605,7 +677,10 @@ export default function RelationshipManager({
                             height={32}
                           />
                         ) : (
-                          <DefaultAvatar gender={rel.targetPerson.gender} />
+                          <DefaultAvatar
+                            gender={rel.targetPerson.gender}
+                            size={32}
+                          />
                         )}
                       </div>
                       <div className="flex flex-col">
